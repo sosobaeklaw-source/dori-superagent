@@ -317,6 +317,7 @@ export async function review(d: Deps, prId: string, authorModel: string, model: 
   const reviewer = model.trim();
   if (!author || !reviewer) throw new Refusal("author and reviewer models must be explicit");
   if (reviewer.toLowerCase() === author.toLowerCase()) throw new Refusal("reviewer must differ from the recorded author model");
+  if (stage === "cross" && reviewer.toLowerCase().includes("opus")) throw new Refusal("cross-review cannot use Opus");
   if (stage === "cross" && d.store.crossReviewCount(pr.id) >= 2) {
     throw new Refusal("cross-review is limited to two rounds per PR");
   }
@@ -324,7 +325,7 @@ export async function review(d: Deps, prId: string, authorModel: string, model: 
     const cross = d.store.receipt(pr.id, sha, "cross");
     if (!cross || cross.verdict !== "CLEAR") throw new Refusal("independent approval requires a CLEAR cross-review at this head");
     if (reviewer.toLowerCase() === cross.model.toLowerCase()) throw new Refusal("approval model must differ from the cross-review model");
-    if (reviewer.toLowerCase().includes("opus")) throw new Refusal("independent approval cannot use Opus");
+    if (!reviewer.toLowerCase().includes("opus")) throw new Refusal("final approval requires Opus");
     if (d.store.receipt(pr.id, sha, "approval")) throw new Refusal("approval review already has a receipt at this head");
   }
   d.store.setAuthorModel(pr.id, author);
@@ -386,10 +387,11 @@ async function gateRefusal(d: Deps, pr: PrRef, sha: string): Promise<[MergeOutco
     const missing = [cross ? undefined : "cross", approval ? undefined : "approval"].filter((stage): stage is string => stage !== undefined);
     return ["no_receipt", "missing review stages at head " + sha.slice(0, 12) + ": " + missing.join(", ")];
   }
+  if (cross.model.toLowerCase().includes("opus")) return ["review_block", "cross-review cannot use Opus"];
+  if (!approval.model.toLowerCase().includes("opus")) return ["review_block", "final approval must use Opus"];
   if (cross.model.toLowerCase() === authorModel.toLowerCase() || approval.model.toLowerCase() === authorModel.toLowerCase() || approval.model.toLowerCase() === cross.model.toLowerCase()) {
     return ["review_block", "author, cross-review, and approval must use different models"];
   }
-  if (approval.model.toLowerCase().includes("opus")) return ["review_block", "independent approval cannot use Opus"];
   return checkRefusal(d, pr);
 }
 
