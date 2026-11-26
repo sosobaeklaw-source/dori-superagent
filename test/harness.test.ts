@@ -312,6 +312,17 @@ describe("review + merge gate", () => {
     expect(w.usage.filter((e) => e.name === "dori.review_completed")).toHaveLength(3);
   });
 
+  test("a same-head BLOCK remains a merge refusal after later CLEAR reviews", async () => {
+    const { w, d } = setup();
+    gh(w, green);
+    w.reviewer = () => ({ code: 0, stdout: "HIGH src/a.ts:3 ...\nVERDICT: BLOCK" });
+    await review(d, "o/r#19", "author/model", "cross/model", "cross");
+    w.reviewer = () => ({ code: 0, stdout: "no findings\nVERDICT: CLEAR" });
+    await review(d, "o/r#19", "author/model", "second-cross/model", "cross");
+    await review(d, "o/r#19", "author/model", "opus-5.5", "approval");
+    await expect(mergeGate(d, "o/r#19")).rejects.toThrow("cross review");
+  });
+
   test("author and reviewer models are distinct and the two-cross-round limit survives head changes", async () => {
     const { w, d } = setup();
     gh(w, green);

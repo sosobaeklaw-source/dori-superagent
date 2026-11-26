@@ -384,10 +384,12 @@ export async function mergeGate(d: Deps, prId: string, opts: { dryRun?: boolean 
 async function gateRefusal(d: Deps, pr: PrRef, sha: string): Promise<[MergeOutcome, string] | undefined> {
   const authorModel = d.store.authorModel(pr.id);
   if (!authorModel) return ["no_receipt", "author model is not recorded for " + pr.id];
-  const cross = d.store.receipt(pr.id, sha, "cross");
-  const approval = d.store.receipt(pr.id, sha, "approval");
-  const blocked = [cross, approval].find((receipt) => receipt && receipt.verdict !== "CLEAR");
+  const crossReceipts = d.store.receipts(pr.id, sha, "cross");
+  const approvalReceipts = d.store.receipts(pr.id, sha, "approval");
+  const blocked = [...crossReceipts, ...approvalReceipts].find((receipt) => receipt.verdict !== "CLEAR");
   if (blocked) return ["review_block", blocked.stage + " review at " + sha.slice(0, 12) + " is " + blocked.verdict];
+  const cross = crossReceipts.at(-1);
+  const approval = approvalReceipts.at(-1);
   if (!cross || !approval) {
     const missing = [cross ? undefined : "cross", approval ? undefined : "approval"].filter((stage): stage is string => stage !== undefined);
     return ["no_receipt", "missing review stages at head " + sha.slice(0, 12) + ": " + missing.join(", ")];
