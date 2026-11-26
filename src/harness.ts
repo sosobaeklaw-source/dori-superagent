@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { cpus, freemem, loadavg, totalmem } from "node:os";
 import { join, resolve } from "node:path";
 import { Herdr, HerdrError, omoScreenIdle, shq, spawnExec, type AgentStatus, type Exec } from "./herdr.ts";
-import { KEY_RE, Store, type HostLoad, type Lane, type Role } from "./store.ts";
+import { KEY_RE, Store, type HostLoad, type Lane, type ReviewStage, type Role } from "./store.ts";
 import { Telemetry, type MergeOutcome, type Usage } from "./telemetry.ts";
 
 export { KEY_RE };
@@ -307,51 +307,91 @@ export async function headSha(d: Deps, pr: PrRef): Promise<string> {
   return String(out.headRefOid);
 }
 
-/** Runs a fresh, non-interactive reviewer session pinned to the PR head and records its verdict as a receipt. */
-export async function review(d: Deps, prId: string, model?: string): Promise<{ verdict: "CLEAR" | "BLOCK"; sha: string }> {
+/** Runs a fresh reviewer session only after the current PR checks pass, pinned to its exact head. */
+export async function review(d: Deps, prId: string, authorModel: string, model: string, stage: ReviewStage): Promise<{ verdict: "CLEAR" | "BLOCK"; sha: string }> {
   const pr = parsePr(prId);
   const sha = await headSha(d, pr);
-  const text = prompt("review.md", { pr: pr.id, repo: pr.repo, number: String(pr.number), sha });
-  const argv = ["-p", "--no-session", ...(model ? ["--model", model] : []), text];
-  const res = await d.exec(d.agentCmd, argv);
-  if (res.code !== 0) throw new Error(`reviewer exited ${res.code}: ${res.stderr.trim()}`);
+  const machineRefusal = await checkRefusal(d, pr);
+  if (machineRefusal) throw new Refusal("REVIEW_REFUSED " + machineRefusal[1]);
+  const author = authorModel.trim();
+  const reviewer = model.trim();
+  if (!author || !reviewer) throw new Refusal("author and reviewer models must be explicit");
+  if (reviewer.toLowerCase() === author.toLowerCase()) throw new Refusal("reviewer must differ from the recorded author model");
+  if (stage === "cross" && d.store.crossReviewCount(pr.id) >= 2) {
+    throw new Refusal("cross-review is limited to two rounds per PR");
+  }
+  if (stage === "approval") {
+    const cross = d.store.receipt(pr.id, sha, "cross");
+    if (!cross || cross.verdict !== "CLEAR") throw new Refusal("independent approval requires a CLEAR cross-review at this head");
+    if (reviewer.toLowerCase() === cross.model.toLowerCase()) throw new Refusal("approval model must differ from the cross-review model");
+    if (reviewer.toLowerCase().includes("opus")) throw new Refusal("independent approval cannot use Opus");
+    if (d.store.receipt(pr.id, sha, "approval")) throw new Refusal("approval review already has a receipt at this head");
+  }
+  d.store.setAuthorModel(pr.id, author);
+  const stageInstructions: Record<ReviewStage, string> = {
+    cross: "Independent cross-review: inspect the exact patch independently of the recorded author model.",
+    approval: "Independent final approval: decide whether the exact reviewed head is ready to merge.",
+  };
+  const text = prompt("review.md", { pr: pr.id, repo: pr.repo, number: String(pr.number), sha }) + "\n\nRecorded author model: " + author + "\n" + stageInstructions[stage];
+  const res = await d.exec(d.agentCmd, ["-p", "--no-session", "--model", reviewer, text]);
+  if (res.code !== 0) throw new Error("reviewer exited " + res.code + ": " + res.stderr.trim());
   const verdicts = [...res.stdout.matchAll(/^VERDICT:\s*(CLEAR|BLOCK)\b/gm)];
   const last = verdicts.at(-1);
   if (!last) throw new Error("reviewer printed no VERDICT line; no receipt written");
   const verdict = last[1] as "CLEAR" | "BLOCK";
-  d.store.saveReceipt({ pr: pr.id, sha, verdict, model: model ?? "default", at: d.now(), summary: res.stdout.trim().slice(-4000) });
+  d.store.saveReceipt({ pr: pr.id, sha, stage, verdict, model: reviewer, at: d.now(), summary: res.stdout.trim().slice(-4000) });
   d.usage.record({ name: "dori.review_completed", verdict });
   return { verdict, sha };
 }
 
 type Check = { name: string; bucket: string };
 
-/** Merge only when the exact current head has a CLEAR review receipt and every check passed. An empty check list is never green. */
+async function checksFor(d: Deps, pr: PrRef): Promise<Check[]> {
+  const out = await gh(d, ["pr", "checks", String(pr.number), "--repo", pr.repo, "--json", "name,bucket"]);
+  return out.trim().startsWith("[") ? JSON.parse(out) as Check[] : [];
+}
+
+async function checkRefusal(d: Deps, pr: PrRef): Promise<[MergeOutcome, string] | undefined> {
+  const checks = await checksFor(d, pr);
+  if (checks.length === 0) return ["no_checks", "no checks reported: an empty check list is never green"];
+  const bad = checks.filter((c) => c.bucket !== "pass" && c.bucket !== "skipping");
+  if (bad.length > 0) return ["checks_red", "checks not green: " + bad.map((c) => c.name + "=" + c.bucket).join(", ")];
+  if (!checks.some((c) => c.bucket === "pass")) return ["checks_all_skipped", "every check was skipped"];
+  return undefined;
+}
+
+/** Merge only when the recorded author, independent cross-review, final approval and reported checks agree at the exact head. */
 export async function mergeGate(d: Deps, prId: string, opts: { dryRun?: boolean } = {}): Promise<string> {
   const pr = parsePr(prId);
   const sha = await headSha(d, pr);
   const refused = await gateRefusal(d, pr, sha);
   if (refused) {
     if (!opts.dryRun) d.usage.record({ name: "dori.merge_decided", outcome: refused[0] });
-    throw new Refusal(`MERGE_REFUSED ${refused[1]}`);
+    throw new Refusal("MERGE_REFUSED " + refused[1]);
   }
-  if (opts.dryRun) return `MERGE_OK ${pr.id} head=${sha} (dry run)`;
+  if (opts.dryRun) return "MERGE_OK " + pr.id + " head=" + sha + " (dry run)";
   await gh(d, ["pr", "merge", String(pr.number), "--repo", pr.repo, "--squash", "--match-head-commit", sha]);
   d.usage.record({ name: "dori.merge_decided", outcome: "merged" });
-  return `MERGED ${pr.id} head=${sha}`;
+  return "MERGED " + pr.id + " head=" + sha;
 }
 
 async function gateRefusal(d: Deps, pr: PrRef, sha: string): Promise<[MergeOutcome, string] | undefined> {
-  const receipt = d.store.receipt(pr.id, sha);
-  if (!receipt) return ["no_receipt", `no review receipt at head ${sha.slice(0, 12)} (run: dori review ${pr.id})`];
-  if (receipt.verdict !== "CLEAR") return ["review_block", `review at ${sha.slice(0, 12)} is ${receipt.verdict}`];
-  const checksRes = await d.exec("gh", ["pr", "checks", String(pr.number), "--repo", pr.repo, "--json", "name,bucket"]);
-  const checks: Check[] = checksRes.stdout.trim().startsWith("[") ? JSON.parse(checksRes.stdout) : [];
-  if (checks.length === 0) return ["no_checks", "no checks reported: an empty check list is never green"];
-  const bad = checks.filter((c) => c.bucket !== "pass" && c.bucket !== "skipping");
-  if (bad.length > 0) return ["checks_red", `checks not green: ${bad.map((c) => `${c.name}=${c.bucket}`).join(", ")}`];
-  if (!checks.some((c) => c.bucket === "pass")) return ["checks_all_skipped", "every check was skipped"];
-  return undefined;
+  const authorModel = d.store.authorModel(pr.id);
+  if (!authorModel) return ["no_receipt", "author model is not recorded for " + pr.id];
+  const cross = d.store.receipt(pr.id, sha, "cross");
+  const approval = d.store.receipt(pr.id, sha, "approval");
+  const blocked = [cross, approval].find((receipt) => receipt && receipt.verdict !== "CLEAR");
+  if (blocked) return ["review_block", blocked.stage + " review at " + sha.slice(0, 12) + " is " + blocked.verdict];
+  if (!cross || !approval) {
+    const missing = [cross ? undefined : "cross", approval ? undefined : "approval"].filter((stage): stage is string => stage !== undefined);
+    return ["no_receipt", "missing review stages at head " + sha.slice(0, 12) + ": " + missing.join(", ")];
+  }
+  if (cross.model.toLowerCase() === authorModel.toLowerCase() || approval.model.toLowerCase() === authorModel.toLowerCase() || approval.model.toLowerCase() === cross.model.toLowerCase()) {
+    return ["review_block", "author, cross-review, and approval must use different models"];
+  }
+  if (approval.model.toLowerCase().includes("opus")) return ["review_block", "independent approval cannot use Opus"];
+  return checkRefusal(d, pr);
 }
+
 
 export const ROLES: readonly Role[] = ["lead", "duty"];

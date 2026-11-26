@@ -126,7 +126,8 @@ dori ready fix-flaky-login --text 'root cause fixed in owner/repo#12, checks gre
 The lead, on `[READY fix-flaky-login]`:
 
 ```sh
-dori review owner/repo#12            # fresh omo reviewer pinned to the head SHA; writes a receipt; exit 0 on CLEAR
+dori review owner/repo#12 --stage cross --author-model author/model --model cross/model
+dori review owner/repo#12 --stage approval --author-model author/model --model neon
 dori merge owner/repo#12 --dry-run   # MERGE_OK ... (dry run), or MERGE_REFUSED <why> with exit 2
 dori merge owner/repo#12             # gh pr merge --squash --match-head-commit <sha>
 dori done fix-flaky-login            # closes the lane's pane; only a READY lane can be closed
@@ -144,7 +145,7 @@ Busy panes are never interrupted. `dori send` asks herdr for the pane's agent st
 
 Nudges at 10, 20 and 40 minutes. `NUDGE_MINUTES = [10, 20, 40]` in `src/harness.ts`. A lane that has not reported for 10 minutes, and whose pane is not working, gets `prompts/nudge.md` in its pane. At 20 it gets it again. At 40 the duty loop stops nudging and sends the lead `[ESCALATE <key>]`. A `working` pane resets the idle clock, a lane that reported `--status waiting` or whose pane is `blocked` is left alone, any new report resets the nudge count, and a pane that disappears is reported as `[LOST <key>]`.
 
-Merge needs a CLEAR receipt at the exact head and green checks. `dori merge` reads the PR's head SHA with `gh`, then requires a receipt for that SHA in `~/.dori/receipts/` with verdict `CLEAR`. Only `dori review` writes receipts. It runs a fresh non-interactive omo (`omo -p --no-session`, optionally `--model`) on `prompts/review.md` pinned to that SHA, and when the reviewer prints no `VERDICT:` line, no receipt is written. Then `gh pr checks` must return at least one check, every check must be `pass` or `skipping`, and at least one must be `pass`. An empty check list is refused with "an empty check list is never green". The merge itself is `gh pr merge --squash --match-head-commit <sha>`. A push after the review changes the head SHA, so the receipt no longer matches and the merge is refused (`review()` and `mergeGate()` in `src/harness.ts`).
+Merge requires a recorded author model, a CLEAR cross-review, and an independent CLEAR approval at the exact head, plus reported green checks. `dori review` takes `--stage cross|approval`, `--author-model`, and `--model`; the author model is recorded once per PR, reviewer models must be distinct, approval cannot use Opus, and at most two cross-reviews are allowed across the PR even when its head changes. Approval requires a CLEAR cross-review at that same head. Each review uses a fresh non-interactive omo (`omo -p --no-session`) on `prompts/review.md` pinned to the head, and no receipt is written without a `VERDICT:` line. `gh pr checks` must report at least one check; every reported check must be `pass` or `skipping`, with at least one `pass`. Names are taken from GitHub's reported checks instead of guessed categories. The merge itself is `gh pr merge --squash --match-head-commit <sha>`.
 
 ## Hourly loop
 

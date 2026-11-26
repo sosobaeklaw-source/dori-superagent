@@ -254,43 +254,94 @@ describe("duty loop", () => {
 
 describe("review + merge gate", () => {
   const head = "a".repeat(40);
-  function gh(w: World, checks: unknown[]) {
+  const nextHead = "b".repeat(40);
+  const green = [
+    { name: "tests", bucket: "pass" },
+    { name: "lint", bucket: "pass" },
+    { name: "typecheck", bucket: "pass" },
+    { name: "security audit", bucket: "pass" },
+    { name: "legacy path", bucket: "pass" },
+  ];
+  function gh(w: World, checks: unknown[], sha = head) {
     w.gh = (argv) => {
-      if (argv[1] === "view") return { code: 0, stdout: JSON.stringify({ headRefOid: head }) };
+      if (argv[1] === "view") return { code: 0, stdout: JSON.stringify({ headRefOid: sha }) };
       if (argv[1] === "checks") return { code: 0, stdout: JSON.stringify(checks) };
       if (argv[1] === "merge") return { code: 0, stdout: "" };
       return { code: 1, stdout: "" };
     };
   }
 
-  test("merge is refused without a receipt, with an empty check list, with red checks; allowed at CLEAR + green", async () => {
+  test("failed mechanical checks stop before a reviewer model runs", async () => {
+    const { w, d } = setup();
+    gh(w, [{ name: "tests", bucket: "fail" }]);
+    await expect(review(d, "o/r#7", "author/model", "cross/model", "cross")).rejects.toThrow("tests=fail");
+    expect(w.calls.filter((call) => call.cmd === "omo")).toHaveLength(0);
+  });
+
+  test("CLI stores the explicit author model and writes a receipt for the requested stage", async () => {
+    const { w, d } = setup();
+    gh(w, green);
+    w.reviewer = () => ({ code: 0, stdout: "no findings\nVERDICT: CLEAR" });
+    expect(await main(["review", "o/r#12", "--stage", "cross", "--author-model", "writer/model", "--model", "cross/model"], d)).toBe(0);
+    expect(d.store.authorModel("o/r#12")).toBe("writer/model");
+    expect(d.store.receipt("o/r#12", head, "cross")!.model).toBe("cross/model");
+  });
+
+  test("any reported passing checks and distinct same-head reviews can pass the merge gate", async () => {
     const { w, d } = setup();
     gh(w, []);
-    await expect(mergeGate(d, "o/r#7")).rejects.toThrow("no review receipt");
+    await expect(mergeGate(d, "o/r#7")).rejects.toThrow("author model is not recorded");
+    gh(w, green);
     w.reviewer = () => ({ code: 0, stdout: "HIGH src/a.ts:3 ...\nVERDICT: BLOCK" });
-    expect((await review(d, "o/r#7")).verdict).toBe("BLOCK");
-    await expect(mergeGate(d, "o/r#7")).rejects.toThrow("is BLOCK");
+    expect((await review(d, "o/r#17", "author/model", "cross/model", "cross")).verdict).toBe("BLOCK");
+    await expect(mergeGate(d, "o/r#17")).rejects.toThrow("cross review");
     w.reviewer = () => ({ code: 0, stdout: "no findings\nVERDICT: CLEAR" });
-    await review(d, "o/r#7", "some/model");
-    expect(d.store.receipt("o/r#7", head)!.model).toBe("some/model");
-    await expect(mergeGate(d, "o/r#7")).rejects.toThrow("never green");
-    gh(w, [{ name: "test", bucket: "fail" }, { name: "lint", bucket: "pass" }]);
-    await expect(mergeGate(d, "o/r#7")).rejects.toThrow("test=fail");
-    gh(w, [{ name: "test", bucket: "skipping" }]);
+    await review(d, "o/r#7", "author/model", "cross/model", "cross");
+    expect(d.store.authorModel("o/r#7")).toBe("author/model");
+    await expect(mergeGate(d, "o/r#7")).rejects.toThrow("approval");
+    await review(d, "o/r#7", "author/model", "neon", "approval");
+    gh(w, [{ name: "docs", bucket: "skipping" }]);
     await expect(mergeGate(d, "o/r#7")).rejects.toThrow("every check was skipped");
-    gh(w, [{ name: "test", bucket: "pass" }, { name: "docs", bucket: "skipping" }]);
-    expect(await mergeGate(d, "o/r#7")).toBe(`MERGED o/r#7 head=${head}`);
+    gh(w, [{ name: "docs", bucket: "skipping" }, { name: "suite alpha", bucket: "pass" }]);
+    expect(await mergeGate(d, "o/r#7", { dryRun: true })).toBe("MERGE_OK o/r#7 head=" + head + " (dry run)");
+    gh(w, [{ name: "suite alpha", bucket: "pass" }, { name: "release", bucket: "fail" }]);
+    await expect(mergeGate(d, "o/r#7")).rejects.toThrow("release=fail");
+    gh(w, [{ name: "suite alpha", bucket: "pass" }, { name: "docs", bucket: "skipping" }]);
+    expect(await mergeGate(d, "o/r#7")).toBe("MERGED o/r#7 head=" + head);
     expect(w.calls.at(-1)!.argv).toContain("--match-head-commit");
-    expect(w.usage.filter((e) => e.name === "dori.merge_decided").map((e) => (e as { outcome: string }).outcome))
-      .toEqual(["no_receipt", "review_block", "no_checks", "checks_red", "checks_all_skipped", "merged"]);
-    expect(w.usage.filter((e) => e.name === "dori.review_completed")).toHaveLength(2);
+    expect(w.usage.filter((e) => e.name === "dori.review_completed")).toHaveLength(3);
+  });
+
+  test("author and reviewer models are distinct and the two-cross-round limit survives head changes", async () => {
+    const { w, d } = setup();
+    gh(w, green);
+    w.reviewer = () => ({ code: 0, stdout: "no findings\nVERDICT: CLEAR" });
+    await expect(review(d, "o/r#8", "same/model", "same/model", "cross")).rejects.toThrow("differ from the recorded author");
+    await review(d, "o/r#8", "same/model", "other/model", "cross");
+    gh(w, green, nextHead);
+    await review(d, "o/r#8", "same/model", "third/model", "cross");
+    const reviewerCalls = w.calls.filter((call) => call.cmd === "omo").length;
+    await expect(review(d, "o/r#8", "same/model", "fourth/model", "cross")).rejects.toThrow("limited to two rounds");
+    expect(w.calls.filter((call) => call.cmd === "omo")).toHaveLength(reviewerCalls);
+    await expect(review(d, "o/r#8", "same/model", "third/model", "approval")).rejects.toThrow("differ from the cross-review model");
+    await review(d, "o/r#8", "same/model", "neon", "approval");
+    await expect(mergeGate(d, "o/r#8", { dryRun: true })).resolves.toContain("MERGE_OK");
+  });
+
+  test("Opus cannot provide independent approval", async () => {
+    const { w, d } = setup();
+    gh(w, green);
+    w.reviewer = () => ({ code: 0, stdout: "no findings\nVERDICT: CLEAR" });
+    await review(d, "o/r#9", "author/model", "cross/model", "cross");
+    await expect(review(d, "o/r#9", "author/model", "opus-5.5", "approval")).rejects.toThrow("cannot use Opus");
+    expect(w.calls.filter((call) => call.cmd === "omo")).toHaveLength(1);
   });
 
   test("a reviewer without a VERDICT line writes no receipt", async () => {
     const { w, d } = setup();
-    gh(w, []);
+    gh(w, green);
     w.reviewer = () => ({ code: 0, stdout: "looks fine I guess" });
-    await expect(review(d, "o/r#8")).rejects.toThrow("no VERDICT");
-    expect(d.store.receipt("o/r#8", head)).toBeUndefined();
+    await expect(review(d, "o/r#10", "author/model", "cross/model", "cross")).rejects.toThrow("no VERDICT");
+    expect(d.store.receipt("o/r#10", head, "cross")).toBeUndefined();
   });
 });
