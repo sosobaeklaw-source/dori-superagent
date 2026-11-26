@@ -7,6 +7,7 @@ import {
 import { shq } from "./herdr.ts";
 import { backlogAdd, backlogDecide, backlogDrop, backlogImport, loopTick, msUntilNext, summary, HOUR, IMPORT_LIMIT } from "./loop.ts";
 import type { Role } from "./store.ts";
+import { connectorStatusLines, type ConnectorProbes } from "./connectors.ts";
 
 const USAGE = `dori - a proactive multi-session harness on herdr + omo
 
@@ -96,12 +97,17 @@ function status(d: Deps): void {
   }
 }
 
-export async function main(argv: readonly string[], d: Deps = defaultDeps()): Promise<number> {
+async function printConnectorStatus(probes?: ConnectorProbes): Promise<void> {
+  for (const line of await connectorStatusLines(probes)) console.log(line);
+}
+
+export async function main(argv: readonly string[], d: Deps = defaultDeps(), probes?: ConnectorProbes): Promise<number> {
   const a = parse(argv);
   const [cmd, x] = a.pos;
   if (cmd !== undefined && COMMANDS.has(cmd)) d.usage.touch();
   switch (cmd) {
     case "up":
+      await printConnectorStatus(probes);
       await up(d, resolve(one(a, "cwd") ?? process.cwd()));
       return 0;
     case "role": {
@@ -248,6 +254,7 @@ export async function main(argv: readonly string[], d: Deps = defaultDeps()): Pr
       return 0;
     case "status":
       status(d);
+      await printConnectorStatus(probes);
       return 0;
     default:
       console.log(USAGE);

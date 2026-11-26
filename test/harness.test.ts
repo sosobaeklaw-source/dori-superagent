@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { main } from "../src/cli.ts";
 import { done, dutyTick, mergeGate, ready, Refusal, report, review, send, startLane } from "../src/harness.ts";
 import { World } from "./fake.ts";
+import { type ConnectorProbes, connectorStatusLines } from "../src/connectors.ts";
 
 function setup() {
   const w = new World();
@@ -292,5 +293,50 @@ describe("review + merge gate", () => {
     w.reviewer = () => ({ code: 0, stdout: "looks fine I guess" });
     await expect(review(d, "o/r#8")).rejects.toThrow("no VERDICT");
     expect(d.store.receipt("o/r#8", head)).toBeUndefined();
+  });
+});
+
+describe("connector status", () => {
+  const expected = ["Aside", "Chrome", "Telegram", "Discord", "Gmail", "Drive"];
+  const probes: ConnectorProbes = {
+    Aside: async () => "정상",
+    Chrome: async () => "정상",
+    Telegram: async () => "정상",
+    Discord: async () => "정상",
+    Gmail: async () => "정상",
+    Drive: async () => "정상",
+  };
+
+  test("returns one safe summary line for each connector", async () => {
+    expect(await connectorStatusLines(probes)).toEqual(expected.map((name) => "연결 " + name + ": 정상"));
+  });
+
+  test("reports a failed probe without stopping the remaining connector checks", async () => {
+    const failing: ConnectorProbes = { ...probes, Gmail: async () => { throw new Error("private probe detail"); } };
+    expect(await connectorStatusLines(failing)).toEqual([
+      "연결 Aside: 정상",
+      "연결 Chrome: 정상",
+      "연결 Telegram: 정상",
+      "연결 Discord: 정상",
+      "연결 Gmail: 검사 실패",
+      "연결 Drive: 정상",
+    ]);
+  });
+
+  test("Dori startup and self-diagnosis both print the connector status", async () => {
+    const { d } = setup();
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...args: unknown[]) => void lines.push(args.join(" "));
+    try {
+      expect(await main(["up"], d, probes)).toBe(0);
+      expect(lines.slice(0, expected.length)).toEqual(expected.map((name) => "연결 " + name + ": 정상"));
+      expect(lines.at(-1)).toStartWith("UP ");
+      lines.length = 0;
+      expect(await main(["status"], d, probes)).toBe(0);
+      expect(lines.filter((line) => line.startsWith("연결 "))).toEqual(expected.map((name) => "연결 " + name + ": 정상"));
+    } finally {
+      console.log = log;
+    }
   });
 });
