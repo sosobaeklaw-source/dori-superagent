@@ -335,22 +335,27 @@ describe("review + merge gate", () => {
     expect(w.calls.filter((call) => call.cmd === "omo")).toHaveLength(0);
   });
 
-  test("final approval refuses non-Opus reviewers after a clear cross-review", async () => {
+  test("final approval refuses unsupported reviewers after a clear cross-review", async () => {
     const { w, d } = setup();
     gh(w, green);
     w.reviewer = () => ({ code: 0, stdout: "no findings\nVERDICT: CLEAR" });
     await review(d, "o/r#13", "author/model", "cross/model", "cross");
-    await expect(review(d, "o/r#13", "author/model", "neon", "approval")).rejects.toThrow("requires Opus");
+    await expect(review(d, "o/r#13", "author/model", "openai/gpt-reviewer", "approval")).rejects.toThrow("requires Opus, Neon, or Antigravity");
     expect(w.calls.filter((call) => call.cmd === "omo")).toHaveLength(1);
   });
 
-  test("final approval accepts Opus after a clear independent cross-review", async () => {
-    const { w, d } = setup();
-    gh(w, green);
-    w.reviewer = () => ({ code: 0, stdout: "no findings\nVERDICT: CLEAR" });
-    await review(d, "o/r#14", "author/model", "cross/model", "cross");
-    await review(d, "o/r#14", "author/model", "opus-5.5", "approval");
-    expect(d.store.receipt("o/r#14", head, "approval")?.model).toBe("opus-5.5");
+  test("final approval accepts each owner-authorized reviewer after a clear independent cross-review", async () => {
+    const finalReviewers = ["opus-5.5", "neon", "antigravity/gemini"];
+    for (const [index, finalReviewer] of finalReviewers.entries()) {
+      const { w, d } = setup();
+      const pr = "o/r#" + (14 + index);
+      gh(w, green);
+      w.reviewer = () => ({ code: 0, stdout: "no findings\nVERDICT: CLEAR" });
+      await review(d, pr, "author/model", "cross/model", "cross");
+      await review(d, pr, "author/model", finalReviewer, "approval");
+      expect(d.store.receipt(pr, head, "approval")?.model).toBe(finalReviewer);
+      await expect(mergeGate(d, pr, { dryRun: true })).resolves.toContain("MERGE_OK");
+    }
   });
 
   test("merge rejects older cross-review receipts created by Opus", async () => {
@@ -362,13 +367,13 @@ describe("review + merge gate", () => {
     await expect(mergeGate(d, "o/r#15")).rejects.toThrow("cross-review cannot use Opus");
   });
 
-  test("merge rejects older non-Opus final approval receipts", async () => {
+  test("merge rejects older unsupported final approval receipts", async () => {
     const { w, d } = setup();
     gh(w, green);
     d.store.setAuthorModel("o/r#16", "author/model");
     d.store.saveReceipt({ pr: "o/r#16", sha: head, stage: "cross", verdict: "CLEAR", model: "cross/model", at: 0, summary: "cross-review" });
-    d.store.saveReceipt({ pr: "o/r#16", sha: head, stage: "approval", verdict: "CLEAR", model: "neon", at: 0, summary: "old receipt" });
-    await expect(mergeGate(d, "o/r#16")).rejects.toThrow("final approval must use Opus");
+    d.store.saveReceipt({ pr: "o/r#16", sha: head, stage: "approval", verdict: "CLEAR", model: "openai/gpt-reviewer", at: 0, summary: "old receipt" });
+    await expect(mergeGate(d, "o/r#16")).rejects.toThrow("final approval must use Opus, Neon, or Antigravity");
   });
 
   test("a reviewer without a VERDICT line writes no receipt", async () => {

@@ -307,6 +307,11 @@ export async function headSha(d: Deps, pr: PrRef): Promise<string> {
   return String(out.headRefOid);
 }
 
+function isFinalApprover(model: string): boolean {
+  const normalized = model.toLowerCase();
+  return ["opus", "neon", "antigravity"].some((name) => normalized.includes(name));
+}
+
 /** Runs a fresh reviewer session only after the current PR checks pass, pinned to its exact head. */
 export async function review(d: Deps, prId: string, authorModel: string, model: string, stage: ReviewStage): Promise<{ verdict: "CLEAR" | "BLOCK"; sha: string }> {
   const pr = parsePr(prId);
@@ -325,7 +330,7 @@ export async function review(d: Deps, prId: string, authorModel: string, model: 
     const cross = d.store.receipt(pr.id, sha, "cross");
     if (!cross || cross.verdict !== "CLEAR") throw new Refusal("independent approval requires a CLEAR cross-review at this head");
     if (reviewer.toLowerCase() === cross.model.toLowerCase()) throw new Refusal("approval model must differ from the cross-review model");
-    if (!reviewer.toLowerCase().includes("opus")) throw new Refusal("final approval requires Opus");
+    if (!isFinalApprover(reviewer)) throw new Refusal("final approval requires Opus, Neon, or Antigravity");
     if (d.store.receipt(pr.id, sha, "approval")) throw new Refusal("approval review already has a receipt at this head");
   }
   d.store.setAuthorModel(pr.id, author);
@@ -388,7 +393,7 @@ async function gateRefusal(d: Deps, pr: PrRef, sha: string): Promise<[MergeOutco
     return ["no_receipt", "missing review stages at head " + sha.slice(0, 12) + ": " + missing.join(", ")];
   }
   if (cross.model.toLowerCase().includes("opus")) return ["review_block", "cross-review cannot use Opus"];
-  if (!approval.model.toLowerCase().includes("opus")) return ["review_block", "final approval must use Opus"];
+  if (!isFinalApprover(approval.model)) return ["review_block", "final approval must use Opus, Neon, or Antigravity"];
   if (cross.model.toLowerCase() === authorModel.toLowerCase() || approval.model.toLowerCase() === authorModel.toLowerCase() || approval.model.toLowerCase() === cross.model.toLowerCase()) {
     return ["review_block", "author, cross-review, and approval must use different models"];
   }
