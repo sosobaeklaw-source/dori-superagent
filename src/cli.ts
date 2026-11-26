@@ -6,7 +6,7 @@ import {
 } from "./harness.ts";
 import { shq } from "./herdr.ts";
 import { backlogAdd, backlogDecide, backlogDrop, backlogImport, loopTick, msUntilNext, summary, HOUR, IMPORT_LIMIT } from "./loop.ts";
-import type { Role } from "./store.ts";
+import type { ReviewStage, Role } from "./store.ts";
 
 const USAGE = `dori - a proactive multi-session harness on herdr + omo
 
@@ -24,8 +24,8 @@ const USAGE = `dori - a proactive multi-session harness on herdr + omo
   dori backlog add <id> --brief FILE [--title T] [--priority 1-9] [--cwd DIR] [--decision Q]
   dori backlog list | decide <id> --text ANSWER | drop <id> [--text WHY]
   dori backlog import <owner/repo> [--label dori] [--cwd DIR]   open labelled issues -> items
-  dori review <owner/repo#N> [--model M]      fresh omo reviewer at the exact head -> receipt
-  dori merge <owner/repo#N> [--dry-run]       CLEAR receipt at head + green checks -> squash merge
+  dori review <owner/repo#N> --stage cross|approval --author-model M --model M  exact-head review -> stage receipt
+  dori merge <owner/repo#N> [--dry-run]       distinct CLEAR reviews + reported green checks -> squash merge
   dori done <key>                             lead closes a READY lane
   dori status
 
@@ -235,8 +235,12 @@ export async function main(argv: readonly string[], d: Deps = defaultDeps()): Pr
       return 0;
     }
     case "review": {
-      const r = await review(d, need(x, "PR"), one(a, "model"));
-      console.log(`REVIEW ${x} head=${r.sha} verdict=${r.verdict}`);
+      const stage = need(one(a, "stage"), "review stage");
+      if (stage !== "cross" && stage !== "approval") throw new Refusal("review stage must be cross or approval");
+      const authorModel = need(one(a, "author-model"), "author model");
+      const model = need(one(a, "model"), "review model");
+      const r = await review(d, need(x, "PR"), authorModel, model, stage as ReviewStage);
+      console.log("REVIEW " + x + " stage=" + stage + " head=" + r.sha + " verdict=" + r.verdict);
       return r.verdict === "CLEAR" ? 0 : 1;
     }
     case "merge":

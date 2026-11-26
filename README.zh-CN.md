@@ -124,9 +124,10 @@ dori ready fix-flaky-login --text 'root cause fixed in owner/repo#12, checks gre
 lead 收到 `[READY fix-flaky-login]` 之后：
 
 ```sh
-dori review owner/repo#12            # fresh omo reviewer pinned to the head SHA; writes a receipt; exit 0 on CLEAR
-dori merge owner/repo#12 --dry-run   # MERGE_OK ... (dry run), or MERGE_REFUSED <why> with exit 2
-dori merge owner/repo#12             # gh pr merge --squash --match-head-commit <sha>
+dori review owner/repo#12 --stage cross --author-model author/model --model cross/model
+dori review owner/repo#12 --stage approval --author-model author/model --model neon
+dori merge owner/repo#12 --dry-run
+dori merge owner/repo#12
 dori done fix-flaky-login            # closes the lane's pane; only a READY lane can be closed
 ```
 
@@ -142,7 +143,7 @@ READY 必须带证据。没有至少一个 `--evidence` 链接，或者没有最
 
 10 分钟、20 分钟催，40 分钟上报。`src/harness.ts` 里有 `NUDGE_MINUTES = [10, 20, 40]`。一条 lane 10 分钟没有汇报、窗格也不在 working，就会在自己的窗格里收到 `prompts/nudge.md`；20 分钟时再收一次；到 40 分钟，duty 循环不再催，改为给 lead 发 `[ESCALATE <key>]`。`working` 状态的窗格会重置空闲计时；汇报过 `--status waiting` 或窗格处于 `blocked` 的 lane 不会被打扰；任何一次新汇报都把催促次数清零；窗格消失则报告为 `[LOST <key>]`。
 
-合并要有精确 head 上的 CLEAR 回执，检查项还得全绿。`dori merge` 用 `gh` 读出 PR 的 head SHA，然后要求 `~/.dori/receipts/` 里存在该 SHA 的、结论为 `CLEAR` 的回执。能写回执的只有 `dori review`。它拿固定在该 SHA 上的 `prompts/review.md` 起一个全新的非交互 omo（`omo -p --no-session`，可选 `--model`）；评审者没有打印 `VERDICT:` 行，就不写回执。接着 `gh pr checks` 必须返回至少一项检查，每一项都必须是 `pass` 或 `skipping`，并且至少有一项是 `pass`。空的检查列表会被拒绝，理由是 "an empty check list is never green"。合并本身是 `gh pr merge --squash --match-head-commit <sha>`。评审之后再 push 会改变 head SHA，回执就对不上了，合并随之被拒绝（`src/harness.ts` 里的 `review()` 和 `mergeGate()`）。
+合并要求每个 PR 已记录作者模型、当前 head 上 CLEAR 的独立交叉审查和最终审批，以及 GitHub 报告的绿色检查。`dori review` 使用 `--stage cross|approval`、`--author-model` 和 `--model`。作者模型每个 PR 只记录一次，各审查模型必须不同；最终审批不能使用 Opus。即使 head 改变，整个 PR 最多进行两轮交叉审查。只有同一 head 的交叉审查为 CLEAR 后才能最终审批。每次审查都用新的非交互 omo（`omo -p --no-session`）运行固定到该 head SHA 的 `prompts/review.md`；没有 `VERDICT:` 行就不会写入回执。`gh pr checks` 必须至少返回一项检查，所有已报告检查都必须是 `pass` 或 `skipping`，且至少有一项 `pass`。检查名称直接读取 GitHub 返回值，不再猜测固定类别。合并命令为 `gh pr merge --squash --match-head-commit <sha>`。
 
 ## 每小时循环
 

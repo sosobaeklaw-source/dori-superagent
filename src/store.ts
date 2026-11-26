@@ -1,4 +1,5 @@
-import { mkdirSync, readdirSync, existsSync, appendFileSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { closeSync, mkdirSync, openSync, readdirSync, existsSync, appendFileSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -22,14 +23,20 @@ export type Role = "lead" | "duty";
 
 export type QueuedMessage = { at: number; from: string; text: string };
 
+export type ReviewStage = "cross" | "approval";
+
 export type ReviewReceipt = {
   pr: string;
   sha: string;
+  stage: ReviewStage;
+  round: number;
   verdict: "CLEAR" | "BLOCK";
   model: string;
   at: number;
   summary: string;
 };
+
+type ReviewOwner = { pr: string; authorModel: string };
 
 export type ItemStatus = "open" | "running" | "done" | "dropped";
 
@@ -151,16 +158,78 @@ export class Store {
       .filter((p) => this.queued(p).length > 0);
   }
 
-  private receiptPath(pr: string, sha: string): string {
-    return join(this.root, "receipts", `${pr.replaceAll("/", "__").replace("#", "_")}@${sha}.json`);
+  private reviewKey(pr: string): string {
+    return pr.replaceAll("/", "__").replace("#", "_");
   }
 
-  saveReceipt(r: ReviewReceipt): void {
-    this.writeJson(this.receiptPath(r.pr, r.sha), r);
+  private authorModelPath(pr: string): string {
+    return join(this.root, "receipts", this.reviewKey(pr) + "@author.json");
   }
 
-  receipt(pr: string, sha: string): ReviewReceipt | undefined {
-    return this.readJson(this.receiptPath(pr, sha));
+  authorModel(pr: string): string | undefined {
+    return this.readJson<ReviewOwner>(this.authorModelPath(pr))?.authorModel;
+  }
+
+  setAuthorModel(pr: string, authorModel: string): void {
+    const normalized = authorModel.trim();
+    const current = this.authorModel(pr);
+    if (current && current.toLowerCase() !== normalized.toLowerCase()) throw new Error("author model already recorded for " + pr);
+    if (!current) this.writeJson(this.authorModelPath(pr), { pr, authorModel: normalized } satisfies ReviewOwner);
+  }
+
+  private receiptPath(pr: string, sha: string, stage: ReviewStage, round: number): string {
+    return join(this.root, "receipts", this.reviewKey(pr) + "@" + sha + "@" + stage + "-" + round + ".json");
+  }
+
+  saveReceipt(r: Omit<ReviewReceipt, "round">): ReviewReceipt {
+    const rounds = r.stage === "cross" ? this.crossReviewCount(r.pr) : this.receipts(r.pr, r.sha, r.stage).length;
+    if (r.stage === "approval" && rounds > 0) throw new Error("approval review already has a receipt at this head");
+    if (r.stage === "cross" && rounds >= 2) throw new Error("cross-review is limited to two rounds per PR");
+    const receipt = { ...r, round: rounds + 1 };
+    this.writeJson(this.receiptPath(r.pr, r.sha, r.stage, receipt.round), receipt);
+    return receipt;
+  }
+
+  crossReviewCount(pr: string): number {
+    const prefix = this.reviewKey(pr) + "@";
+    return readdirSync(join(this.root, "receipts"))
+      .filter((name) => name.startsWith(prefix) && name.includes("@cross-") && name.endsWith(".json"))
+      .length;
+  }
+
+  async withReviewLock<T>(pr: string, run: () => Promise<T>): Promise<T> {
+    const path = join(this.root, "receipts", this.reviewKey(pr) + "@review.lock");
+    let fd: number;
+    try {
+      fd = openSync(path, "wx", 0o600);
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
+        throw new Error("a review or merge is already in progress for " + pr);
+      }
+      throw error;
+    }
+    const token = randomUUID();
+    try {
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, token }));
+      return await run();
+    } finally {
+      closeSync(fd);
+      const lock = this.readJson<{ token?: string }>(path);
+      if (lock?.token === token) rmSync(path, { force: true });
+    }
+  }
+
+  receipts(pr: string, sha: string, stage: ReviewStage): ReviewReceipt[] {
+    const prefix = this.reviewKey(pr) + "@" + sha + "@" + stage + "-";
+    return readdirSync(join(this.root, "receipts"))
+      .filter((name) => name.startsWith(prefix) && name.endsWith(".json"))
+      .map((name) => this.readJson<ReviewReceipt>(join(this.root, "receipts", name)))
+      .filter((receipt): receipt is ReviewReceipt => receipt !== undefined)
+      .sort((a, b) => a.round - b.round);
+  }
+
+  receipt(pr: string, sha: string, stage: ReviewStage): ReviewReceipt | undefined {
+    return this.receipts(pr, sha, stage).at(-1);
   }
 
   // ---------- backlog ----------

@@ -126,7 +126,8 @@ dori ready fix-flaky-login --text 'root cause fixed in owner/repo#12, checks gre
 리드는 `[READY fix-flaky-login]`을 받으면:
 
 ```sh
-dori review owner/repo#12            # fresh omo reviewer pinned to the head SHA; writes a receipt; exit 0 on CLEAR
+dori review owner/repo#12 --stage cross --author-model author/model --model cross/model
+dori review owner/repo#12 --stage approval --author-model author/model --model neon
 dori merge owner/repo#12 --dry-run   # MERGE_OK ... (dry run), or MERGE_REFUSED <why> with exit 2
 dori merge owner/repo#12             # gh pr merge --squash --match-head-commit <sha>
 dori done fix-flaky-login            # closes the lane's pane; only a READY lane can be closed
@@ -144,7 +145,7 @@ READY에는 증거가 붙어야 합니다. `dori ready`는 `--evidence` 링크�
 
 nudge는 10분, 20분, 40분입니다. `src/harness.ts`의 `NUDGE_MINUTES = [10, 20, 40]`입니다. 10분 동안 보고가 없고 pane도 working이 아닌 레인은 자기 pane에 `prompts/nudge.md`를 받습니다. 20분에 한 번 더 받습니다. 40분이 되면 듀티 루프는 nudge를 그만두고 리드에게 `[ESCALATE <key>]`를 보냅니다. `working`인 pane은 idle 시계가 되돌아가고, `--status waiting`으로 보고했거나 pane이 `blocked`인 레인은 건드리지 않고, 새 보고가 오면 nudge 횟수가 0으로 돌아가고, pane이 사라지면 `[LOST <key>]`로 보고됩니다.
 
-머지에는 정확한 head의 CLEAR 영수증과 녹색 체크가 필요합니다. `dori merge`는 `gh`로 PR의 head SHA를 읽고, 그 SHA에 대한 영수증이 `~/.dori/receipts/`에 verdict `CLEAR`로 있어야 넘어갑니다. 영수증을 쓰는 것은 `dori review`뿐입니다. `dori review`는 그 SHA에 고정한 `prompts/review.md`로 새 비대화형 omo(`omo -p --no-session`, 필요하면 `--model`)를 돌리고, 리뷰어가 `VERDICT:` 줄을 출력하지 않으면 영수증을 쓰지 않습니다. 그다음 `gh pr checks`가 체크를 하나 이상 돌려줘야 하고, 모든 체크가 `pass`나 `skipping`이어야 하고, 그중 하나 이상은 `pass`여야 합니다. 빈 체크 목록은 "an empty check list is never green"으로 거절합니다. 머지 자체는 `gh pr merge --squash --match-head-commit <sha>`입니다. 리뷰 뒤에 push가 들어오면 head SHA가 바뀌어 영수증이 맞지 않게 되고, 머지는 거절됩니다(`src/harness.ts`의 `review()`와 `mergeGate()`).
+머지하려면 PR마다 기록한 작성 모델, 현재 head에서 CLEAR를 받은 교차 검수와 별도 결재, 그리고 GitHub가 보고한 통과 체크가 필요합니다. `dori review`는 `--stage cross|approval`, `--author-model`, `--model`을 받습니다. 작성 모델은 PR마다 한 번만 기록하고, 검수 모델은 서로 달라야 하며, 결재에는 Opus를 쓸 수 없습니다. PR의 head가 바뀌어도 교차 검수는 최대 두 번입니다. 결재는 같은 head에서 CLEAR를 받은 교차 검수 뒤에만 가능합니다. 각 검수는 head SHA에 고정한 `prompts/review.md`를 새 비대화형 omo(`omo -p --no-session`)로 실행하고, `VERDICT:` 줄이 없으면 영수증을 쓰지 않습니다. `gh pr checks`는 체크를 하나 이상 돌려줘야 하고, 보고된 체크는 모두 `pass` 또는 `skipping`이어야 하며 하나 이상은 `pass`여야 합니다. 체크 이름은 임의로 정한 범주가 아니라 GitHub 응답에서 가져옵니다. 머지는 `gh pr merge --squash --match-head-commit <sha>`로 수행합니다.
 
 ## 한 시간 루프
 

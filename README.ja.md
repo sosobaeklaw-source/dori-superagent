@@ -126,7 +126,8 @@ dori ready fix-flaky-login --text 'root cause fixed in owner/repo#12, checks gre
 `[READY fix-flaky-login]` を受け取った lead は:
 
 ```sh
-dori review owner/repo#12            # fresh omo reviewer pinned to the head SHA; writes a receipt; exit 0 on CLEAR
+dori review owner/repo#12 --stage cross --author-model author/model --model cross/model
+dori review owner/repo#12 --stage approval --author-model author/model --model neon
 dori merge owner/repo#12 --dry-run   # MERGE_OK ... (dry run), or MERGE_REFUSED <why> with exit 2
 dori merge owner/repo#12             # gh pr merge --squash --match-head-commit <sha>
 dori done fix-flaky-login            # closes the lane's pane; only a READY lane can be closed
@@ -144,7 +145,7 @@ READY にはエビデンスが要ります。`dori ready` は、`--evidence` の
 
 10 分、20 分、40 分で催促します。`src/harness.ts` の `NUDGE_MINUTES = [10, 20, 40]` です。10 分間報告がなく、ペインも working でない lane は、自分のペインに `prompts/nudge.md` を受け取ります。20 分でもう一度。40 分で duty ループは催促をやめ、lead に `[ESCALATE <key>]` を送ります。`working` のペインはアイドル時間をリセットし、`--status waiting` で報告した lane やペインが `blocked` の lane には触れません。新しい報告があれば催促の回数は 0 に戻り、ペインが消えれば `[LOST <key>]` として報告されます。
 
-マージには、head SHA に厳密に一致する CLEAR の receipt と、グリーンのチェックが要ります。`dori merge` は `gh` で PR の head SHA を読み、その SHA に対する verdict が `CLEAR` の receipt が `~/.dori/receipts/` にあることを要求します。receipt を書くのは `dori review` だけです。`dori review` は、その SHA に固定した `prompts/review.md` で新しい非対話モードの omo（`omo -p --no-session`、必要なら `--model` も）を走らせ、レビュアーが `VERDICT:` 行を出さなければ receipt を書きません。次に `gh pr checks` がチェックを一つ以上返し、すべてのチェックが `pass` か `skipping` で、そのうち一つ以上が `pass` でなければなりません。空のチェック一覧は "an empty check list is never green" と言って拒否します。マージ自体は `gh pr merge --squash --match-head-commit <sha>` です。レビュー後に push すると head SHA が変わり、receipt が一致しなくなるのでマージは拒否されます（`src/harness.ts` の `review()` と `mergeGate()`）。
+マージには、PR ごとに記録した作成モデル、現在の head で CLEAR になった独立クロスレビューと最終承認、GitHub が報告したグリーンチェックが必要です。`dori review` は `--stage cross|approval`、`--author-model`、`--model` を受け取ります。作成モデルは PR ごとに一度だけ記録し、レビュー担当モデルはすべて異なる必要があります。最終承認に Opus は使えません。head が変わってもクロスレビューは PR 全体で最大 2 回です。最終承認は同じ head の CLEAR クロスレビュー後に限られます。各レビューは head SHA に固定した `prompts/review.md` を新しい非対話 omo（`omo -p --no-session`）で実行し、`VERDICT:` 行がなければ receipt を書きません。`gh pr checks` は 1 件以上を返し、報告された全チェックが `pass` または `skipping` で、そのうち 1 件以上は `pass` である必要があります。チェック名は固定カテゴリではなく GitHub の応答から取得します。マージは `gh pr merge --squash --match-head-commit <sha>` で行います。
 
 ## 1 時間ループ
 
