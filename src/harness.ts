@@ -293,7 +293,8 @@ export type PrRef = { repo: string; number: number; id: string };
 export function parsePr(s: string): PrRef {
   const m = /^([\w.-]+\/[\w.-]+)#(\d+)$/.exec(s);
   if (!m) throw new Refusal(`PR must look like owner/repo#123, got ${s}`);
-  return { repo: m[1]!, number: Number(m[2]), id: s };
+  const number = Number(m[2]);
+  return { repo: m[1]!, number, id: `${m[1]}#${number}` };
 }
 
 async function gh(d: Deps, argv: readonly string[]): Promise<string> {
@@ -302,63 +303,73 @@ async function gh(d: Deps, argv: readonly string[]): Promise<string> {
   return r.stdout;
 }
 
+type PrSnapshot = { head: string; base: string; changedFiles: number };
+
+async function prSnapshot(d: Deps, pr: PrRef): Promise<PrSnapshot> {
+  const out = JSON.parse(await gh(d, ["pr", "view", String(pr.number), "--repo", pr.repo, "--json", "headRefOid,baseRefOid,changedFiles"])) as { headRefOid?: unknown; baseRefOid?: unknown; changedFiles?: unknown };
+  if (typeof out.headRefOid !== "string" || !/^[\da-f]{40}$/i.test(out.headRefOid) || typeof out.baseRefOid !== "string" || !/^[\da-f]{40}$/i.test(out.baseRefOid) || typeof out.changedFiles !== "number" || !Number.isSafeInteger(out.changedFiles) || out.changedFiles < 1) throw new Refusal("GitHub returned an incomplete PR snapshot");
+  return { head: out.headRefOid, base: out.baseRefOid, changedFiles: out.changedFiles };
+}
+
 export async function headSha(d: Deps, pr: PrRef): Promise<string> {
-  const out = JSON.parse(await gh(d, ["pr", "view", String(pr.number), "--repo", pr.repo, "--json", "headRefOid"]));
-  return String(out.headRefOid);
+  return (await prSnapshot(d, pr)).head;
+}
+
+type ReviewModel = { id: string; cli: string };
+
+async function resolveReviewModel(d: Deps, requested: string): Promise<ReviewModel> {
+  const [name, thinking, extra] = requested.trim().split(":");
+  if (!name || extra !== undefined || (thinking !== undefined && !/^[a-z]+$/.test(thinking))) {
+    throw new Refusal("review model must be an exact provider/model identifier with an optional thinking level");
+  }
+  const listing = await d.exec(d.agentCmd, ["--list-models"]);
+  if (listing.code !== 0) throw new Error("could not resolve reviewer model: " + listing.stderr.trim());
+  const available = new Set(listing.stdout.split(/\r?\n/).flatMap((line) => {
+    const columns = line.trim().split(/\s+/);
+    return columns.length >= 3 && /^\d+(?:\.\d+)?[KMG]$/i.test(columns[2]!) ? [`${columns[0]}/${columns[1]}`] : [];
+  }));
+  const id = [...available].find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+  if (!id) throw new Refusal("review model is not an exact model from omo --list-models: " + name);
+  return { id, cli: id + (thinking === undefined ? "" : ":" + thinking) };
+}
+
+function isOpus(model: string): boolean {
+  return /(?:^|[\/_-])opus(?:$|[\/_-])/i.test(model);
 }
 
 function isFinalApprover(model: string): boolean {
-  const normalized = model.toLowerCase();
-  return ["opus", "neon", "antigravity"].some((name) => normalized.includes(name));
+  return /opus|neon|antigravity/i.test(model);
 }
 
-/** Runs a fresh reviewer session only after the current PR checks pass, pinned to its exact head. */
-export async function review(d: Deps, prId: string, authorModel: string, model: string, stage: ReviewStage): Promise<{ verdict: "CLEAR" | "BLOCK"; sha: string }> {
-  const pr = parsePr(prId);
-  const sha = await headSha(d, pr);
-  const machineRefusal = await checkRefusal(d, pr);
-  if (machineRefusal) throw new Refusal("REVIEW_REFUSED " + machineRefusal[1]);
-  const author = authorModel.trim();
-  const reviewer = model.trim();
-  if (!author || !reviewer) throw new Refusal("author and reviewer models must be explicit");
-  if (reviewer.toLowerCase() === author.toLowerCase()) throw new Refusal("reviewer must differ from the recorded author model");
-  if (stage === "cross" && reviewer.toLowerCase().includes("opus")) throw new Refusal("cross-review cannot use Opus");
-  if (stage === "cross" && d.store.crossReviewCount(pr.id) >= 2) {
-    throw new Refusal("cross-review is limited to two rounds per PR");
-  }
-  if (stage === "approval") {
-    const cross = d.store.receipt(pr.id, sha, "cross");
-    if (!cross || cross.verdict !== "CLEAR") throw new Refusal("independent approval requires a CLEAR cross-review at this head");
-    if (reviewer.toLowerCase() === cross.model.toLowerCase()) throw new Refusal("approval model must differ from the cross-review model");
-    if (!isFinalApprover(reviewer)) throw new Refusal("final approval requires Opus, Neon, or Antigravity");
-    if (d.store.receipt(pr.id, sha, "approval")) throw new Refusal("approval review already has a receipt at this head");
-  }
-  d.store.setAuthorModel(pr.id, author);
-  const stageInstructions: Record<ReviewStage, string> = {
-    cross: "Independent cross-review: inspect the exact patch independently of the recorded author model.",
-    approval: "Independent final approval: decide whether the exact reviewed head is ready to merge.",
-  };
-  const text = prompt("review.md", { pr: pr.id, repo: pr.repo, number: String(pr.number), sha }) + "\n\nRecorded author model: " + author + "\n" + stageInstructions[stage];
-  const res = await d.exec(d.agentCmd, ["-p", "--no-session", "--model", reviewer, text]);
-  if (res.code !== 0) throw new Error("reviewer exited " + res.code + ": " + res.stderr.trim());
-  const verdicts = [...res.stdout.matchAll(/^VERDICT:\s*(CLEAR|BLOCK)\b/gm)];
-  const last = verdicts.at(-1);
-  if (!last) throw new Error("reviewer printed no VERDICT line; no receipt written");
-  const verdict = last[1] as "CLEAR" | "BLOCK";
-  d.store.saveReceipt({ pr: pr.id, sha, stage, verdict, model: reviewer, at: d.now(), summary: res.stdout.trim().slice(-4000) });
-  d.usage.record({ name: "dori.review_completed", verdict });
-  return { verdict, sha };
+async function diffForHead(d: Deps, pr: PrRef, base: string, head: string, changedFiles: number): Promise<string> {
+  const response = JSON.parse(await gh(d, ["api", "repos/" + pr.repo + "/compare/" + base + "..." + head])) as { files?: { filename?: string; status?: string; patch?: string }[] };
+  if (!Array.isArray(response.files) || response.files.length !== changedFiles) throw new Refusal("GitHub did not return every file in the exact PR diff");
+  return response.files.map((file) => {
+    if (!file.filename || typeof file.patch !== "string") throw new Refusal("the exact PR diff is incomplete; a changed file has no text patch");
+    return "diff -- " + file.filename + " (" + (file.status ?? "changed") + ")\n" + file.patch;
+  }).join("\n\n");
 }
 
 type Check = { name: string; bucket: string };
 
-async function checksFor(d: Deps, pr: PrRef): Promise<Check[]> {
-  const out = await gh(d, ["pr", "checks", String(pr.number), "--repo", pr.repo, "--json", "name,bucket"]);
-  return out.trim().startsWith("[") ? JSON.parse(out) as Check[] : [];
+async function checksForSha(d: Deps, pr: PrRef, sha: string): Promise<Check[]> {
+  const [runsText, statusText] = await Promise.all([
+    gh(d, ["api", `repos/${pr.repo}/commits/${sha}/check-runs`, "-F", "per_page=100"]),
+    gh(d, ["api", "repos/" + pr.repo + "/commits/" + sha + "/status"]),
+  ]);
+  const runResponse = JSON.parse(runsText) as { total_count?: number; check_runs?: { name?: string; status?: string; conclusion?: string | null }[] };
+  const runs = runResponse.check_runs ?? [];
+  const checks = runs.map((run) => ({
+    name: run.name ?? "unnamed check",
+    bucket: run.status !== "completed" ? "pending" : run.conclusion === "success" ? "pass" : run.conclusion === "skipped" || run.conclusion === "neutral" ? "skipping" : "fail",
+  }));
+  if (typeof runResponse.total_count === "number" && runResponse.total_count > runs.length) checks.push({ name: "check-run response incomplete", bucket: "pending" });
+  const status = JSON.parse(statusText) as { state?: string; statuses?: unknown[] };
+  if ((status.statuses?.length ?? 0) > 0) checks.push({ name: "combined status", bucket: status.state === "success" ? "pass" : status.state === "pending" ? "pending" : "fail" });
+  return checks;
 }
 
-async function checkRefusal(d: Deps, pr: PrRef): Promise<[MergeOutcome, string] | undefined> {
-  const checks = await checksFor(d, pr);
+function checkRefusal(checks: Check[]): [MergeOutcome, string] | undefined {
   if (checks.length === 0) return ["no_checks", "no checks reported: an empty check list is never green"];
   const bad = checks.filter((c) => c.bucket !== "pass" && c.bucket !== "skipping");
   if (bad.length > 0) return ["checks_red", "checks not green: " + bad.map((c) => c.name + "=" + c.bucket).join(", ")];
@@ -366,19 +377,76 @@ async function checkRefusal(d: Deps, pr: PrRef): Promise<[MergeOutcome, string] 
   return undefined;
 }
 
+function assistantOutput(stdout: string): { model: string; text: string } {
+  const records = stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+  const messages = records.flatMap((record) => {
+    if (record.type === "message_end" && typeof record.message === "object" && record.message !== null) return [record.message as Record<string, unknown>];
+    if (record.type === "agent_end" && Array.isArray(record.messages)) return record.messages.filter((message): message is Record<string, unknown> => typeof message === "object" && message !== null);
+    return [];
+  }).filter((message) => message.role === "assistant");
+  const message = messages.at(-1);
+  if (!message || typeof message.provider !== "string" || typeof message.model !== "string") throw new Error("reviewer output did not report its actual provider and model");
+  const content = message.content;
+  const text = typeof content === "string" ? content : Array.isArray(content) ? content.flatMap((part) => typeof part === "object" && part !== null && "text" in part && typeof part.text === "string" ? [part.text] : []).join("\n") : "";
+  return { model: message.provider + "/" + message.model, text };
+}
+
+/** Runs an exact diff review only after checks for that immutable head pass. */
+export async function review(d: Deps, prId: string, authorModel: string, model: string, stage: ReviewStage): Promise<{ verdict: "CLEAR" | "BLOCK"; sha: string }> {
+  const pr = parsePr(prId);
+  return d.store.withReviewLock(pr.id, async () => {
+    const { head: sha, base, changedFiles } = await prSnapshot(d, pr);
+    const [checks, diff] = await Promise.all([checksForSha(d, pr, sha), diffForHead(d, pr, base, sha, changedFiles)]);
+    const machineRefusal = checkRefusal(checks);
+    if (machineRefusal) throw new Refusal("REVIEW_REFUSED " + machineRefusal[1]);
+    const author = await resolveReviewModel(d, authorModel);
+    const reviewer = await resolveReviewModel(d, model);
+    if (reviewer.id.toLowerCase() === author.id.toLowerCase()) throw new Refusal("reviewer must differ from the recorded author model");
+    if (stage === "cross" && isOpus(reviewer.id)) throw new Refusal("cross-review cannot use Opus");
+    if (stage === "cross" && d.store.crossReviewCount(pr.id) >= 2) throw new Refusal("cross-review is limited to two rounds per PR");
+    if (stage === "approval") {
+      const cross = d.store.receipt(pr.id, sha, "cross");
+      if (!cross || cross.verdict !== "CLEAR") throw new Refusal("independent approval requires a CLEAR cross-review at this head");
+      if (reviewer.id.toLowerCase() === cross.model.toLowerCase()) throw new Refusal("approval model must differ from the cross-review model");
+      if (!isFinalApprover(reviewer.id)) throw new Refusal("final approval requires Opus, Neon, or Antigravity");
+      if (d.store.receipt(pr.id, sha, "approval")) throw new Refusal("approval review already has a receipt at this head");
+    }
+    d.store.setAuthorModel(pr.id, author.id);
+    const stageInstructions: Record<ReviewStage, string> = {
+      cross: "Independent cross-review of the exact inline patch, independent of the recorded author model.",
+      approval: "Independent final approval of the exact inline patch.",
+    };
+    const text = prompt("review.md", { pr: pr.id, repo: pr.repo, number: String(pr.number), sha }) + "\n\nRecorded author model: " + author.id + "\n" + stageInstructions[stage] + "\n\nExact diff for base " + base + "...head " + sha + ":\n--- BEGIN EXACT DIFF ---\n" + diff + "\n--- END EXACT DIFF ---\n";
+    const res = await d.exec(d.agentCmd, ["-p", "--no-session", "--no-tools", "--mode", "json", "--model", reviewer.cli, text]);
+    if (res.code !== 0) throw new Error("reviewer exited " + res.code + ": " + res.stderr.trim());
+    const output = assistantOutput(res.stdout);
+    if (output.model.toLowerCase() !== reviewer.id.toLowerCase()) throw new Error("reviewer actually ran " + output.model + ", expected " + reviewer.id + "; no receipt written");
+    const verdicts = [...output.text.matchAll(/^VERDICT:\s*(CLEAR|BLOCK)\b/gm)];
+    const last = verdicts.at(-1);
+    if (!last) throw new Error("reviewer printed no VERDICT line; no receipt written");
+    if (await headSha(d, pr) !== sha) throw new Refusal("PR head changed during review; result discarded without a receipt");
+    const verdict = last[1] as "CLEAR" | "BLOCK";
+    d.store.saveReceipt({ pr: pr.id, sha, stage, verdict, model: output.model, at: d.now(), summary: output.text.trim().slice(-4000) });
+    d.usage.record({ name: "dori.review_completed", verdict });
+    return { verdict, sha };
+  });
+}
+
 /** Merge only when the recorded author, independent cross-review, final approval and reported checks agree at the exact head. */
 export async function mergeGate(d: Deps, prId: string, opts: { dryRun?: boolean } = {}): Promise<string> {
   const pr = parsePr(prId);
-  const sha = await headSha(d, pr);
-  const refused = await gateRefusal(d, pr, sha);
-  if (refused) {
-    if (!opts.dryRun) d.usage.record({ name: "dori.merge_decided", outcome: refused[0] });
-    throw new Refusal("MERGE_REFUSED " + refused[1]);
-  }
-  if (opts.dryRun) return "MERGE_OK " + pr.id + " head=" + sha + " (dry run)";
-  await gh(d, ["pr", "merge", String(pr.number), "--repo", pr.repo, "--squash", "--match-head-commit", sha]);
-  d.usage.record({ name: "dori.merge_decided", outcome: "merged" });
-  return "MERGED " + pr.id + " head=" + sha;
+  return d.store.withReviewLock(pr.id, async () => {
+    const sha = await headSha(d, pr);
+    const refused = await gateRefusal(d, pr, sha);
+    if (refused) {
+      if (!opts.dryRun) d.usage.record({ name: "dori.merge_decided", outcome: refused[0] });
+      throw new Refusal("MERGE_REFUSED " + refused[1]);
+    }
+    if (opts.dryRun) return "MERGE_OK " + pr.id + " head=" + sha + " (dry run)";
+    await gh(d, ["pr", "merge", String(pr.number), "--repo", pr.repo, "--squash", "--match-head-commit", sha]);
+    d.usage.record({ name: "dori.merge_decided", outcome: "merged" });
+    return "MERGED " + pr.id + " head=" + sha;
+  });
 }
 
 async function gateRefusal(d: Deps, pr: PrRef, sha: string): Promise<[MergeOutcome, string] | undefined> {
@@ -399,7 +467,7 @@ async function gateRefusal(d: Deps, pr: PrRef, sha: string): Promise<[MergeOutco
   if (cross.model.toLowerCase() === authorModel.toLowerCase() || approval.model.toLowerCase() === authorModel.toLowerCase() || approval.model.toLowerCase() === cross.model.toLowerCase()) {
     return ["review_block", "author, cross-review, and approval must use different models"];
   }
-  return checkRefusal(d, pr);
+  return checkRefusal(await checksForSha(d, pr, sha));
 }
 
 

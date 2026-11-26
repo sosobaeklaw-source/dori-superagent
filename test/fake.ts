@@ -20,6 +20,8 @@ export class World {
   /** number of upcoming `pane send-keys` calls that fail (exit 1) */
   keyFails = 0;
   gh: (argv: readonly string[]) => { code: number; stdout: string } = () => ({ code: 1, stdout: "" });
+  modelListing = ["author/model", "writer/model", "cross/model", "second-cross/model", "same/model", "other/model", "third/model", "fourth/model", "openai/gpt-reviewer", "anthropic/opus-5.5", "anthropic/opus-final", "magpie/neon", "antigravity/gemini"].map((id) => `${id.replace("/", " ")} 100K 16K yes yes`).join("\n");
+  actualModelOverride?: string;
   usage: TelemetryEvent[] = [];
   dutyCounts: DutyCounts[] = [];
   touches = 0;
@@ -29,7 +31,7 @@ export class World {
     duty: (c) => { this.dutyCounts.push(c); },
     flush: async () => {},
   };
-  reviewer: (argv: readonly string[]) => { code: number; stdout: string } = () => ({ code: 0, stdout: "VERDICT: CLEAR" });
+  reviewer: (argv: readonly string[]) => { code: number; stdout: string } | Promise<{ code: number; stdout: string }> = () => ({ code: 0, stdout: "VERDICT: CLEAR" });
 
   addPane(id: string, status: AgentStatus = "idle"): Pane {
     const p = { status, received: [], ran: [] };
@@ -40,7 +42,15 @@ export class World {
   exec: Exec = async (cmd, argv) => {
     this.calls.push({ cmd, argv });
     if (cmd === "gh") return { ...this.gh(argv), stderr: "" };
-    if (cmd !== "herdr") return { ...this.reviewer(argv), stderr: "" };
+    if (cmd !== "herdr") {
+      if (argv[0] === "--list-models") return { code: 0, stdout: this.modelListing, stderr: "" };
+      const result = await this.reviewer(argv);
+      if (!argv.includes("--mode") || !argv.includes("json")) return { ...result, stderr: "" };
+      const requested = argv[argv.indexOf("--model") + 1] ?? "unknown/model";
+      const actual = this.actualModelOverride ?? requested;
+      const [provider, ...modelParts] = actual.split("/");
+      return { code: result.code, stdout: JSON.stringify({ type: "message_end", message: { role: "assistant", provider, model: modelParts.join("/"), content: [{ type: "text", text: result.stdout }] } }) + "\n", stderr: "" };
+    }
     const ok = (result: unknown) => ({ code: 0, stdout: JSON.stringify({ result }), stderr: "" });
     const [group, verb, id] = argv;
     if ((group === "tab" || group === "workspace") && verb === "create") {

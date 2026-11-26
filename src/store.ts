@@ -1,4 +1,5 @@
-import { mkdirSync, readdirSync, existsSync, appendFileSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { closeSync, mkdirSync, openSync, readdirSync, existsSync, appendFileSync, readFileSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -194,6 +195,28 @@ export class Store {
     return readdirSync(join(this.root, "receipts"))
       .filter((name) => name.startsWith(prefix) && name.includes("@cross-") && name.endsWith(".json"))
       .length;
+  }
+
+  async withReviewLock<T>(pr: string, run: () => Promise<T>): Promise<T> {
+    const path = join(this.root, "receipts", this.reviewKey(pr) + "@review.lock");
+    let fd: number;
+    try {
+      fd = openSync(path, "wx", 0o600);
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
+        throw new Error("a review or merge is already in progress for " + pr);
+      }
+      throw error;
+    }
+    const token = randomUUID();
+    try {
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, token }));
+      return await run();
+    } finally {
+      closeSync(fd);
+      const lock = this.readJson<{ token?: string }>(path);
+      if (lock?.token === token) rmSync(path, { force: true });
+    }
   }
 
   receipts(pr: string, sha: string, stage: ReviewStage): ReviewReceipt[] {

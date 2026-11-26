@@ -262,20 +262,27 @@ describe("review + merge gate", () => {
     { name: "security audit", bucket: "pass" },
     { name: "legacy path", bucket: "pass" },
   ];
-  function gh(w: World, checks: unknown[], sha = head) {
+  function gh(w: World, checks: { name: string; bucket: string }[], initialSha = head) {
+    let sha = initialSha;
     w.gh = (argv) => {
-      if (argv[1] === "view") return { code: 0, stdout: JSON.stringify({ headRefOid: sha }) };
-      if (argv[1] === "checks") return { code: 0, stdout: JSON.stringify(checks) };
-      if (argv[1] === "merge") return { code: 0, stdout: "" };
+      if (argv[0] === "pr" && argv[1] === "view") return { code: 0, stdout: JSON.stringify({ headRefOid: sha, baseRefOid: "c".repeat(40), changedFiles: 1 }) };
+      if (argv[0] === "pr" && argv[1] === "merge") return { code: 0, stdout: "" };
+      if (argv[0] === "api" && argv[1]!.endsWith("/check-runs")) {
+        const checkRuns = checks.map((check) => ({ name: check.name, status: check.bucket === "pending" ? "queued" : "completed", conclusion: check.bucket === "pass" ? "success" : check.bucket === "skipping" ? "skipped" : check.bucket === "pending" ? null : "failure" }));
+        return { code: 0, stdout: JSON.stringify({ total_count: checkRuns.length, check_runs: checkRuns }) };
+      }
+      if (argv[0] === "api" && argv[1]!.endsWith("/status")) return { code: 0, stdout: JSON.stringify({ state: "success", statuses: [] }) };
+      if (argv[0] === "api" && argv[1]!.includes("/compare/")) return { code: 0, stdout: JSON.stringify({ files: [{ filename: "src/reviewed.ts", status: "modified", patch: "@@ -1 +1 @@\\n-old\\n+new" }] }) };
       return { code: 1, stdout: "" };
     };
+    return { setHead: (next: string) => { sha = next; } };
   }
 
   test("failed mechanical checks stop before a reviewer model runs", async () => {
     const { w, d } = setup();
     gh(w, [{ name: "tests", bucket: "fail" }]);
     await expect(review(d, "o/r#7", "author/model", "cross/model", "cross")).rejects.toThrow("tests=fail");
-    expect(w.calls.filter((call) => call.cmd === "omo")).toHaveLength(0);
+    expect(w.calls.filter((call) => call.cmd === "omo" && call.argv.includes("-p"))).toHaveLength(0);
   });
 
   test("CLI stores the explicit author model and writes a receipt for the requested stage", async () => {
@@ -285,6 +292,52 @@ describe("review + merge gate", () => {
     expect(await main(["review", "o/r#12", "--stage", "cross", "--author-model", "writer/model", "--model", "cross/model"], d)).toBe(0);
     expect(d.store.authorModel("o/r#12")).toBe("writer/model");
     expect(d.store.receipt("o/r#12", head, "cross")!.model).toBe("cross/model");
+  });
+
+  test("review prompt contains the exact pinned PR diff", async () => {
+    const { w, d } = setup();
+    gh(w, green);
+    await review(d, "o/r#7", "author/model", "cross/model", "cross");
+    const call = w.calls.find((entry) => entry.cmd === "omo" && entry.argv.includes("-p"))!;
+    expect(call.argv).toContain("--mode");
+    expect(call.argv[call.argv.indexOf("--mode") + 1]).toBe("json");
+    expect(call.argv.at(-1)).toContain("Exact diff for base ");
+    expect(call.argv.at(-1)).toContain("@@ -1 +1 @@");
+  });
+
+  test("a runner fallback to another model writes no review receipt", async () => {
+    const { w, d } = setup();
+    gh(w, green);
+    w.actualModelOverride = "other/model";
+    await expect(review(d, "o/r#7", "author/model", "cross/model", "cross")).rejects.toThrow("reviewer actually ran other/model");
+    expect(d.store.receipt("o/r#7", head, "cross")).toBeUndefined();
+  });
+
+  test("a head change while the reviewer runs discards its verdict", async () => {
+    const { w, d } = setup();
+    const pr = gh(w, green);
+    w.reviewer = () => {
+      pr.setHead(nextHead);
+      return { code: 0, stdout: "VERDICT: CLEAR" };
+    };
+    await expect(review(d, "o/r#7", "author/model", "cross/model", "cross")).rejects.toThrow("PR head changed during review");
+    expect(d.store.receipt("o/r#7", head, "cross")).toBeUndefined();
+  });
+
+  test("a second review cannot race an in-flight review for the same PR", async () => {
+    const { w, d } = setup();
+    gh(w, green);
+    const started = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<{ code: number; stdout: string }>();
+    w.reviewer = () => {
+      started.resolve();
+      return finish.promise;
+    };
+    const first = review(d, "o/r#7", "author/model", "cross/model", "cross");
+    await started.promise;
+    await expect(review(d, "o/r#7", "author/model", "second-cross/model", "cross")).rejects.toThrow("already in progress");
+    finish.resolve({ code: 0, stdout: "VERDICT: CLEAR" });
+    await expect(first).resolves.toMatchObject({ verdict: "CLEAR", sha: head });
   });
 
   test("any reported passing checks and distinct same-head reviews can pass the merge gate", async () => {
@@ -299,7 +352,7 @@ describe("review + merge gate", () => {
     await review(d, "o/r#7", "author/model", "cross/model", "cross");
     expect(d.store.authorModel("o/r#7")).toBe("author/model");
     await expect(mergeGate(d, "o/r#7")).rejects.toThrow("approval");
-    await review(d, "o/r#7", "author/model", "opus-5.5", "approval");
+    await review(d, "o/r#7", "author/model", "anthropic/opus-5.5", "approval");
     gh(w, [{ name: "docs", bucket: "skipping" }]);
     await expect(mergeGate(d, "o/r#7")).rejects.toThrow("every check was skipped");
     gh(w, [{ name: "docs", bucket: "skipping" }, { name: "suite alpha", bucket: "pass" }]);
@@ -319,7 +372,7 @@ describe("review + merge gate", () => {
     await review(d, "o/r#19", "author/model", "cross/model", "cross");
     w.reviewer = () => ({ code: 0, stdout: "no findings\nVERDICT: CLEAR" });
     await review(d, "o/r#19", "author/model", "second-cross/model", "cross");
-    await review(d, "o/r#19", "author/model", "opus-5.5", "approval");
+    await review(d, "o/r#19", "author/model", "anthropic/opus-5.5", "approval");
     await expect(mergeGate(d, "o/r#19")).rejects.toThrow("cross review");
   });
 
@@ -331,19 +384,19 @@ describe("review + merge gate", () => {
     await review(d, "o/r#8", "same/model", "other/model", "cross");
     gh(w, green, nextHead);
     await review(d, "o/r#8", "same/model", "third/model", "cross");
-    const reviewerCalls = w.calls.filter((call) => call.cmd === "omo").length;
+    const reviewerCalls = w.calls.filter((call) => call.cmd === "omo" && call.argv.includes("-p")).length;
     await expect(review(d, "o/r#8", "same/model", "fourth/model", "cross")).rejects.toThrow("limited to two rounds");
-    expect(w.calls.filter((call) => call.cmd === "omo")).toHaveLength(reviewerCalls);
+    expect(w.calls.filter((call) => call.cmd === "omo" && call.argv.includes("-p"))).toHaveLength(reviewerCalls);
     await expect(review(d, "o/r#8", "same/model", "third/model", "approval")).rejects.toThrow("differ from the cross-review model");
-    await review(d, "o/r#8", "same/model", "opus-5.5", "approval");
+    await review(d, "o/r#8", "same/model", "anthropic/opus-5.5", "approval");
     await expect(mergeGate(d, "o/r#8", { dryRun: true })).resolves.toContain("MERGE_OK");
   });
 
   test("cross-review refuses Opus before calling a reviewer", async () => {
     const { w, d } = setup();
     gh(w, green);
-    await expect(review(d, "o/r#9", "author/model", "opus-5.5", "cross")).rejects.toThrow("cross-review cannot use Opus");
-    expect(w.calls.filter((call) => call.cmd === "omo")).toHaveLength(0);
+    await expect(review(d, "o/r#9", "author/model", "anthropic/opus-5.5", "cross")).rejects.toThrow("cross-review cannot use Opus");
+    expect(w.calls.filter((call) => call.cmd === "omo" && call.argv.includes("-p"))).toHaveLength(0);
   });
 
   test("final approval refuses unsupported reviewers after a clear cross-review", async () => {
@@ -352,11 +405,11 @@ describe("review + merge gate", () => {
     w.reviewer = () => ({ code: 0, stdout: "no findings\nVERDICT: CLEAR" });
     await review(d, "o/r#13", "author/model", "cross/model", "cross");
     await expect(review(d, "o/r#13", "author/model", "openai/gpt-reviewer", "approval")).rejects.toThrow("requires Opus, Neon, or Antigravity");
-    expect(w.calls.filter((call) => call.cmd === "omo")).toHaveLength(1);
+    expect(w.calls.filter((call) => call.cmd === "omo" && call.argv.includes("-p"))).toHaveLength(1);
   });
 
   test("final approval accepts each owner-authorized reviewer after a clear independent cross-review", async () => {
-    const finalReviewers = ["opus-5.5", "neon", "antigravity/gemini"];
+    const finalReviewers = ["anthropic/opus-5.5", "magpie/neon", "antigravity/gemini"];
     for (const [index, finalReviewer] of finalReviewers.entries()) {
       const { w, d } = setup();
       const pr = "o/r#" + (14 + index);
@@ -373,8 +426,8 @@ describe("review + merge gate", () => {
     const { w, d } = setup();
     gh(w, green);
     d.store.setAuthorModel("o/r#15", "author/model");
-    d.store.saveReceipt({ pr: "o/r#15", sha: head, stage: "cross", verdict: "CLEAR", model: "opus-5.5", at: 0, summary: "old receipt" });
-    d.store.saveReceipt({ pr: "o/r#15", sha: head, stage: "approval", verdict: "CLEAR", model: "opus-final", at: 0, summary: "approval" });
+    d.store.saveReceipt({ pr: "o/r#15", sha: head, stage: "cross", verdict: "CLEAR", model: "anthropic/opus-5.5", at: 0, summary: "old receipt" });
+    d.store.saveReceipt({ pr: "o/r#15", sha: head, stage: "approval", verdict: "CLEAR", model: "anthropic/opus-final", at: 0, summary: "approval" });
     await expect(mergeGate(d, "o/r#15")).rejects.toThrow("cross-review cannot use Opus");
   });
 
